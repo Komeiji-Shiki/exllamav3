@@ -6,7 +6,11 @@ from ..model.config import Config
 from ..model.model import Model
 from ..util.rope import RopeStyle, RopeSettings
 from .mm_processing.common import convert_to_rgb, normalize_image
-from .mm_processing.qwen2 import qwen2_smart_resize, qwen2_position_embedding_grid_2d
+from .mm_processing.qwen2 import (
+    qwen2_position_embedding_grid_2d,
+    qwen2_smart_resize,
+    qwen2_smart_resize_t,
+)
 from ..util.file import read_dict,  no_default
 from ..modules import (
     TransformerBlock,
@@ -116,7 +120,7 @@ def read_qwen3_vl_vision_config(config_dict: dict):
     return v
 
 
-def read_qwen3_vl_pp_config(config_dict: dict):
+def _read_qwen3_vl_pp_config(config_dict: dict):
     pp = SimpleNamespace(**{
         k: read_dict(config_dict, t, k, no_default)
         for k, t in [
@@ -126,15 +130,26 @@ def read_qwen3_vl_pp_config(config_dict: dict):
             ("merge_size", int),
             ("image_mean", list),
             ("image_std", list),
-            ("image_processor_type", str),
         ]
     })
     pp.resample = 3
     pp.rescale_factor = 1 / 255
     pp.min_pixels = pp.size["shortest_edge"]  # Mislabeled in preprocessor_config
     pp.max_pixels = pp.size["longest_edge"]
-    assert pp.image_processor_type == "Qwen2VLImageProcessorFast", \
+    return pp
+
+
+def read_qwen3_vl_pp_config(config_dict: dict):
+    pp = _read_qwen3_vl_pp_config(config_dict)
+    assert config_dict.get("image_processor_type") == "Qwen2VLImageProcessorFast", \
         "Expected image_processor_type to be 'Qwen2VLImageProcessorFast'"
+    return pp
+
+
+def read_qwen3_vl_video_pp_config(config_dict: dict):
+    pp = _read_qwen3_vl_pp_config(config_dict)
+    assert config_dict.get("video_processor_type") == "Qwen3VLVideoProcessor", \
+        "Expected video_processor_type to be 'Qwen3VLVideoProcessor'"
     return pp
 
 
@@ -167,8 +182,15 @@ class Qwen3VLVisionModel(Model):
         self.config = config
         self.caps.update({
             "image_input": True,
+            "video_input": True,
             "default_vision_bits": 6,
         })
+        video_prep_path = os.path.join(self.config.directory, "video_preprocessor_config.json")
+        if os.path.exists(video_prep_path):
+            with open(video_prep_path, encoding = "utf8") as f:
+                self.video_pp = read_qwen3_vl_video_pp_config(json.load(f))
+        else:
+            self.video_pp = self.config.vision_pp
         v = self.config.vision
 
         self.modules += [
@@ -277,21 +299,24 @@ class Qwen3VLVisionModel(Model):
         images: Image | list[Image]
     ) -> (torch.Tensor, tuple):
         v = self.config.vision
-        pp = self.config.vision_pp
-        resample = Image.Resampling(pp.resample)
-        image_mean, image_std = tuple(pp.image_mean), tuple(pp.image_std)
 
-        # Make list and truncate to whole number of spatial patches
+        # Make list and pad video to a whole number of temporal patches
         if not isinstance(images, list):
             mode = "image"
+            pp = self.config.vision_pp
             images = [images]
         else:
             mode = "video"
+            pp = self.video_pp
+            if not images:
+                raise ValueError("Video must contain at least one frame")
             g = pp.temporal_patch_size
-            frames = len(images)
-            if frames > 1:
-                frames = frames // g * g
-                images = images[:frames]
+            pad = -len(images) % g
+            if pad:
+                images = images + [images[-1]] * pad
+
+        resample = Image.Resampling(pp.resample)
+        image_mean, image_std = tuple(pp.image_mean), tuple(pp.image_std)
 
         # Convert to RGB and resize as necessary
         images = [convert_to_rgb(image) for image in images]
@@ -300,12 +325,22 @@ class Qwen3VLVisionModel(Model):
         assert all(old_size == frame.size for frame in images), \
             "All frames in video must have same dimensions"
 
-        new_size = qwen2_smart_resize(
-            old_size,
-            pp.patch_size * v.spatial_merge_size,
-            pp.min_pixels,
-            pp.max_pixels,
-        )
+        if mode == "image":
+            new_size = qwen2_smart_resize(
+                old_size,
+                pp.patch_size * v.spatial_merge_size,
+                pp.min_pixels,
+                pp.max_pixels,
+            )
+        else:
+            new_size = qwen2_smart_resize_t(
+                len(images),
+                old_size,
+                pp.temporal_patch_size,
+                pp.patch_size * v.spatial_merge_size,
+                pp.min_pixels,
+                pp.max_pixels,
+            )
         if old_size != new_size:
             images = [image.resize(new_size, resample = resample) for image in images]
 
@@ -422,6 +457,104 @@ class Qwen3VLVisionModel(Model):
             mmes.append(mme)
 
         return mmes if return_batch else mmes[0]
+
+
+    def get_video_embeddings(
+        self,
+        tokenizer: Tokenizer,
+        frames: list[Image],
+        timestamps: list[float] | None = None,
+        text_alias: str | None = None,
+    ) -> list[MMEmbedding]:
+        """Encode one video and expose each temporal patch as an MMEmbedding."""
+
+        assert frames, "Video must contain at least one frame"
+        assert text_alias is None, "Cannot apply a single alias to a multi-part video"
+
+        v = self.config.vision
+        video_tensor, prep_image_size, grid_thw = self.preprocess(frames)
+        video_tensor = video_tensor.unsqueeze(0)
+
+        inv_freq = qwen2_position_embedding_grid_2d(
+            grid_thw,
+            v.head_dim,
+            v.spatial_merge_size,
+            v.rope_theta,
+        )
+        params = {
+            "causal": False,
+            "grid_thw": torch.tensor([grid_thw], dtype = torch.int),
+            "inv_freq": inv_freq,
+        }
+        embedding_tensor = self.forward(video_tensor, params = params).cpu()
+
+        grid_t, grid_h, grid_w = grid_thw
+        assert embedding_tensor.shape[1] % grid_t == 0, \
+            "Video embeddings do not divide evenly into temporal patches"
+        tokens_per_patch = embedding_tensor.shape[1] // grid_t
+
+        temporal_patch_size = self.video_pp.temporal_patch_size
+        padded_frame_count = grid_t * temporal_patch_size
+        if timestamps is None:
+            timestamps = [float(i) for i in range(len(frames))]
+        elif len(timestamps) != len(frames):
+            raise ValueError("Video timestamps must match the number of frames")
+        else:
+            timestamps = list(timestamps)
+
+        if len(timestamps) < padded_frame_count:
+            timestamps.extend([timestamps[-1]] * (padded_frame_count - len(timestamps)))
+        else:
+            timestamps = timestamps[:padded_frame_count]
+
+        patch_timestamps = [
+            (
+                timestamps[i * temporal_patch_size]
+                + timestamps[(i + 1) * temporal_patch_size - 1]
+            ) / 2
+            for i in range(grid_t)
+        ]
+
+        mmes = []
+        for i, timestamp in enumerate(patch_timestamps):
+            start = i * tokens_per_patch
+            end = start + tokens_per_patch
+            timestamp_ids = tokenizer.encode(
+                f"<{timestamp:.1f} seconds>",
+                encode_special_tokens = True,
+            ).squeeze(0).tolist()
+            token_string = torch.tensor(
+                [[
+                    *timestamp_ids,
+                    self.config.vision_start_token_id,
+                    *([-1] * tokens_per_patch),
+                    self.config.vision_end_token_id,
+                ]],
+                dtype = torch.long,
+            )
+
+            mme = MMEmbedding(
+                embeddings = embedding_tensor[0, start:end],
+                token_string = token_string,
+                deepstack_embeddings = [
+                    de.squeeze(0)[start:end]
+                    for de in params["deepstack"]
+                ] if "deepstack" in params else None,
+                grid_thw = (1, grid_h, grid_w),
+                mrope_merge_size = v.spatial_merge_size,
+            )
+            mme.metadata.update({
+                "original_size": frames[0].size,
+                "preprocessed_size": prep_image_size,
+                "model_architecture": self.config.architecture,
+                "media_type": "video",
+                "video_frame_count": len(frames),
+                "video_patch_index": i,
+                "timestamp": timestamp,
+            })
+            mmes.append(mme)
+
+        return mmes
 
 
     @override
